@@ -47,6 +47,7 @@ ENV/
 *.model
 *.ckpt
 best_model.pth
+best_model_fold*.pth
 
 # 数据文件（根据需要调整）
 # data/*.tsv
@@ -62,6 +63,8 @@ training_history.png
 confusion_matrix.png
 prediction_distribution.png
 predictions.csv
+kfold_results.png
+kfold_results.csv
 results/
 outputs/
 
