@@ -4,15 +4,17 @@ Unified runner for training and evaluating the new model without BERT.
 import argparse
 import time
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import config
-from dataset import prepare_data, TextMatchDataset
+from dataset import TextMatchDataset, load_data
 from model_new_no_bert import create_new_no_bert_model, NewTextMatchModelNoBert
 from train import compute_metrics, plot_training_history, set_seed
+from sklearn.model_selection import train_test_split
 
 
 def build_dataloaders(
@@ -39,7 +41,29 @@ def build_dataloaders(
     return train_loader, val_loader
 
 
+def split_data_8_1_1():
+    files = [config.TRAIN_FILE_1, getattr(config, "TRAIN_FILE_2", None)]
+    files = [f for f in files if f]
+    df = load_data(files)
+
+    train_df, temp_df = train_test_split(
+        df,
+        test_size=0.2,
+        random_state=config.SEED,
+        stratify=df["label"],
+    )
+    val_df, test_df = train_test_split(
+        temp_df,
+        test_size=0.5,
+        random_state=config.SEED,
+        stratify=temp_df["label"],
+    )
+    return train_df, val_df, test_df
+
+
 def train(
+    train_df,
+    val_df,
     contrastive_weight=0.2,
     batch_size=256,
     num_workers=4,
@@ -47,6 +71,7 @@ def train(
     persistent_workers=True,
     pin_memory=True,
     cudnn_benchmark=True,
+    use_pos_weight=True,
 ):
     print("=" * 80)
     print("🚀 训练新模型 (无BERT)")
@@ -56,7 +81,6 @@ def train(
     torch.backends.cudnn.benchmark = cudnn_benchmark
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
-    train_df, val_df = prepare_data()
     train_loader, val_loader = build_dataloaders(
         train_df,
         val_df,
@@ -68,7 +92,14 @@ def train(
     )
 
     model = create_new_no_bert_model().to(config.DEVICE)
-    criterion = nn.BCEWithLogitsLoss()
+    if use_pos_weight:
+        pos_count = (train_df["label"] == 1).sum()
+        neg_count = (train_df["label"] == 0).sum()
+        pos_weight = torch.tensor([neg_count / max(pos_count, 1)], device=config.DEVICE)
+        print(f"⚖️  使用 pos_weight={pos_weight.item():.4f}")
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    else:
+        criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY
     )
@@ -167,7 +198,16 @@ def train(
 
 
 @torch.no_grad()
-def evaluate(model_path, val_df, batch_size=256, num_workers=4, pin_memory=True):
+def evaluate(
+    model_path,
+    val_df,
+    test_df,
+    batch_size=256,
+    num_workers=4,
+    pin_memory=True,
+    threshold_metric="f1",
+    threshold_step=0.01,
+):
     print("=" * 80)
     print("Evaluating new model (no BERT)")
     print("=" * 80)
@@ -194,30 +234,57 @@ def evaluate(model_path, val_df, batch_size=256, num_workers=4, pin_memory=True)
         print(f"⚠️  忽略未匹配参数: {unexpected}")
     model.eval()
 
-    val_dataset = TextMatchDataset(val_df, max_len=config.MAX_LEN)
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+    def predict_probs(dataframe):
+        dataset = TextMatchDataset(dataframe, max_len=config.MAX_LEN)
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        all_labels, all_probs = [], []
+        for batch in loader:
+            query1 = batch["query1"].to(config.DEVICE)
+            query2 = batch["query2"].to(config.DEVICE)
+            labels = batch["label"].cpu().numpy()
+
+            logits = model(query1, query2)
+            probs = torch.sigmoid(logits).cpu().numpy()
+
+            all_labels.extend(labels)
+            all_probs.extend(probs)
+        return np.array(all_labels), np.array(all_probs)
+
+    val_labels, val_probs = predict_probs(val_df)
+    best_threshold = 0.5
+    best_score = -1.0
+    best_metrics = None
+
+    thresholds = np.arange(threshold_step, 1.0, threshold_step)
+    for thr in thresholds:
+        preds = (val_probs >= thr).astype(int)
+        metrics = compute_metrics(val_labels, preds, val_probs)
+        score = metrics.get(threshold_metric, 0.0)
+        if score > best_score:
+            best_score = score
+            best_threshold = float(thr)
+            best_metrics = metrics
+
+    if best_metrics is None:
+        best_metrics = compute_metrics(
+            val_labels, (val_probs >= 0.5).astype(int), val_probs
+        )
+
+    print(
+        f"🔧 验证集最优阈值: {best_threshold:.2f} (metric={threshold_metric}) "
+        f"Precision={best_metrics['precision']:.4f} Recall={best_metrics['recall']:.4f} "
+        f"F1={best_metrics['f1']:.4f} AUC={best_metrics['auc']:.4f}"
     )
 
-    all_labels, all_probs, all_preds = [], [], []
-    for batch in val_loader:
-        query1 = batch["query1"].to(config.DEVICE)
-        query2 = batch["query2"].to(config.DEVICE)
-        labels = batch["label"].cpu().numpy()
-
-        logits = model(query1, query2)
-        probs = torch.sigmoid(logits).cpu().numpy()
-        preds = (probs > 0.5).astype(int)
-
-        all_labels.extend(labels)
-        all_probs.extend(probs)
-        all_preds.extend(preds)
-
-    metrics = compute_metrics(all_labels, all_preds, all_probs)
+    test_labels, test_probs = predict_probs(test_df)
+    test_preds = (test_probs >= best_threshold).astype(int)
+    metrics = compute_metrics(test_labels, test_preds, test_probs)
     print(
         "Accuracy: {:.4f}  Precision: {:.4f}  Recall: {:.4f}  F1: {:.4f}  AUC: {:.4f}".format(
             metrics["accuracy"],
@@ -247,12 +314,17 @@ def main():
     parser.add_argument("--persistent_workers", action="store_true", default=True)
     parser.add_argument("--pin_memory", action="store_true", default=True)
     parser.add_argument("--no_cudnn_benchmark", action="store_true")
+    parser.add_argument("--no_pos_weight", action="store_true")
+    parser.add_argument("--threshold_metric", type=str, default="f1")
+    parser.add_argument("--threshold_step", type=float, default=0.01)
     args = parser.parse_args()
 
-    train_df, val_df = prepare_data()
+    train_df, val_df, test_df = split_data_8_1_1()
 
     if args.mode in ["train", "all"]:
         train(
+            train_df,
+            val_df,
             contrastive_weight=args.contrastive_weight,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
@@ -260,15 +332,19 @@ def main():
             persistent_workers=args.persistent_workers,
             pin_memory=args.pin_memory,
             cudnn_benchmark=not args.no_cudnn_benchmark,
+            use_pos_weight=not args.no_pos_weight,
         )
 
     if args.mode in ["eval", "all"]:
         evaluate(
             args.model_path,
             val_df,
+            test_df,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             pin_memory=args.pin_memory,
+            threshold_metric=args.threshold_metric,
+            threshold_step=args.threshold_step,
         )
 
 
