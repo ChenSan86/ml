@@ -6,23 +6,65 @@ import time
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import config
-from dataset import prepare_data, get_dataloaders
+from dataset import prepare_data, TextMatchDataset
 from model_new_no_bert import create_new_no_bert_model, NewTextMatchModelNoBert
 from train import compute_metrics, plot_training_history, set_seed
 
 
-def train(use_contrastive=False, contrastive_weight=0.2):
+def build_dataloaders(
+    train_df,
+    val_df,
+    batch_size,
+    num_workers,
+    prefetch_factor,
+    persistent_workers,
+    pin_memory,
+):
+    train_dataset = TextMatchDataset(train_df, max_len=config.MAX_LEN)
+    val_dataset = TextMatchDataset(val_df, max_len=config.MAX_LEN)
+    common_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        common_kwargs["prefetch_factor"] = prefetch_factor
+        common_kwargs["persistent_workers"] = persistent_workers
+    train_loader = DataLoader(train_dataset, shuffle=True, **common_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **common_kwargs)
+    return train_loader, val_loader
+
+
+def train(
+    contrastive_weight=0.2,
+    batch_size=256,
+    num_workers=4,
+    prefetch_factor=2,
+    persistent_workers=True,
+    pin_memory=True,
+    cudnn_benchmark=True,
+):
     print("=" * 80)
     print("🚀 训练新模型 (无BERT)")
     print("=" * 80)
 
     set_seed(config.SEED)
+    torch.backends.cudnn.benchmark = cudnn_benchmark
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
     train_df, val_df = prepare_data()
-    train_loader, val_loader = get_dataloaders(
-        train_df, val_df, config.BATCH_SIZE, config.NUM_WORKERS
+    train_loader, val_loader = build_dataloaders(
+        train_df,
+        val_df,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
     )
 
     model = create_new_no_bert_model().to(config.DEVICE)
@@ -58,12 +100,8 @@ def train(use_contrastive=False, contrastive_weight=0.2):
 
             optimizer.zero_grad()
 
-            if use_contrastive:
-                logits, repr1, repr2 = model(query1, query2, return_reprs=True)
-                cont_loss = NewTextMatchModelNoBert.contrastive_loss(repr1, repr2, labels)
-            else:
-                logits = model(query1, query2)
-                cont_loss = 0.0
+            logits, repr1, repr2 = model(query1, query2, return_reprs=True)
+            cont_loss = NewTextMatchModelNoBert.contrastive_loss(repr1, repr2, labels)
 
             bce_loss = criterion(logits, labels)
             loss = bce_loss + contrastive_weight * cont_loss
@@ -129,18 +167,40 @@ def train(use_contrastive=False, contrastive_weight=0.2):
 
 
 @torch.no_grad()
-def evaluate(model_path, val_df):
+def evaluate(model_path, val_df, batch_size=256, num_workers=4, pin_memory=True):
     print("=" * 80)
     print("Evaluating new model (no BERT)")
     print("=" * 80)
 
-    model = create_new_no_bert_model().to(config.DEVICE)
     checkpoint = torch.load(model_path, map_location=config.DEVICE, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    state = checkpoint["model_state_dict"]
+
+    # Infer NUM_LAYERS from fusion.proj.weight shape: [hidden_dim, num_layers*hidden_dim*3]
+    proj_weight = state.get("fusion.proj.weight")
+    if proj_weight is not None:
+        hidden_dim = proj_weight.shape[0]
+        concat_dim = proj_weight.shape[1]
+        inferred_layers = concat_dim // (hidden_dim * 3)
+        if inferred_layers > 0 and inferred_layers != config.NUM_LAYERS:
+            print(
+                f"⚙️  从权重推断 NUM_LAYERS={inferred_layers} "
+                f"(当前={config.NUM_LAYERS})，将临时覆盖以匹配权重"
+            )
+            config.NUM_LAYERS = inferred_layers
+
+    model = create_new_no_bert_model().to(config.DEVICE)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if unexpected:
+        print(f"⚠️  忽略未匹配参数: {unexpected}")
     model.eval()
 
-    _, val_loader = get_dataloaders(
-        val_df, val_df, config.BATCH_SIZE, config.NUM_WORKERS
+    val_dataset = TextMatchDataset(val_df, max_len=config.MAX_LEN)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
 
     all_labels, all_probs, all_preds = [], [], []
@@ -180,20 +240,36 @@ def main():
         help="Run mode: train, eval, or all",
     )
     parser.add_argument("--model_path", type=str, default="best_model_new_no_bert.pth")
-    parser.add_argument("--contrastive", action="store_true")
     parser.add_argument("--contrastive_weight", type=float, default=0.2)
+    parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE)
+    parser.add_argument("--num_workers", type=int, default=config.NUM_WORKERS)
+    parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument("--persistent_workers", action="store_true", default=True)
+    parser.add_argument("--pin_memory", action="store_true", default=True)
+    parser.add_argument("--no_cudnn_benchmark", action="store_true")
     args = parser.parse_args()
 
     train_df, val_df = prepare_data()
 
     if args.mode in ["train", "all"]:
         train(
-            use_contrastive=args.contrastive,
             contrastive_weight=args.contrastive_weight,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            persistent_workers=args.persistent_workers,
+            pin_memory=args.pin_memory,
+            cudnn_benchmark=not args.no_cudnn_benchmark,
         )
 
     if args.mode in ["eval", "all"]:
-        evaluate(args.model_path, val_df)
+        evaluate(
+            args.model_path,
+            val_df,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_memory,
+        )
 
 
 if __name__ == "__main__":
