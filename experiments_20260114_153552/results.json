@@ -1,0 +1,38 @@
+[
+  {
+    "exp_id": "0_baseline",
+    "name": "\u57fa\u7ebf\u6a21\u578b (BiLSTM)",
+    "auc": 0.9569018210220533,
+    "accuracy": 0.8927,
+    "f1": 0.8623211650734587,
+    "time_minutes": 1.4037538806597392,
+    "status": "success"
+  },
+  {
+    "exp_id": "1_attention",
+    "name": "+ \u6ce8\u610f\u529b\u673a\u5236",
+    "auc": 0.9546497980435158,
+    "accuracy": 0.85805,
+    "f1": 0.8335190289098693,
+    "time_minutes": 1.63271404504776,
+    "status": "success"
+  },
+  {
+    "exp_id": "3_feature_engineering",
+    "name": "+ \u7279\u5f81\u5de5\u7a0b (19\u4e2a\u7279\u5f81)",
+    "auc": 0.9542523903030677,
+    "accuracy": 0.891075,
+    "f1": 0.8590469412183365,
+    "time_minutes": 3.959801109631856,
+    "status": "success"
+  },
+  {
+    "exp_id": "6_ensemble",
+    "name": "+ \u6a21\u578b\u96c6\u6210 (K\u6298)",
+    "auc": 0.9617001870342825,
+    "accuracy": 0,
+    "f1": 0,
+    "time_minutes": 11.54833691517512,
+    "status": "success"
+  }
+]
