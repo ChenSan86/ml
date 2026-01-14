@@ -314,7 +314,7 @@ def main():
     parser.add_argument("--persistent_workers", action="store_true", default=True)
     parser.add_argument("--pin_memory", action="store_true", default=True)
     parser.add_argument("--no_cudnn_benchmark", action="store_true")
-    parser.add_argument("--no_pos_weight", action="store_true")
+    parser.add_argument("--no_pos_weight", action="store_true", default=True)
     parser.add_argument("--threshold_metric", type=str, default="f1")
     parser.add_argument("--threshold_step", type=float, default=0.01)
     args = parser.parse_args()

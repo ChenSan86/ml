@@ -11,9 +11,9 @@ class Config:
     # 模型参数
     VOCAB_SIZE = 34000  # 词表大小，最大词ID是33957
     EMBED_DIM = 300      # 词嵌入维度
-    HIDDEN_DIM = 512     # LSTM隐藏层维度
+    HIDDEN_DIM = 384     # LSTM隐藏层维度
     NUM_LAYERS = 2       # LSTM层数
-    DROPOUT = 0.3        # Dropout比例
+    DROPOUT = 0.5        # Dropout比例
     MAX_LEN = 60         # 最大序列长度
     
     # 训练参数
