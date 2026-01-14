@@ -50,7 +50,7 @@ class BertTextMatchDataset(Dataset):
         }
 
 
-def get_bert_dataloaders(train_df, val_df, tokenizer, batch_size=32, num_workers=2):
+def get_bert_dataloaders(train_df, val_df, tokenizer, batch_size=64, num_workers=2):
     train_dataset = BertTextMatchDataset(train_df, tokenizer, max_len=config.MAX_LEN)
     val_dataset = BertTextMatchDataset(val_df, tokenizer, max_len=config.MAX_LEN)
     train_loader = DataLoader(
@@ -70,7 +70,13 @@ def get_bert_dataloaders(train_df, val_df, tokenizer, batch_size=32, num_workers
     return train_loader, val_loader
 
 
-def train(use_contrastive=False, contrastive_weight=0.2, freeze_bert=False):
+def train(
+    use_contrastive=False,
+    contrastive_weight=0.2,
+    freeze_bert=True,
+    num_layers=1,
+    use_amp=True,
+):
     print("=" * 80)
     print("🚀 训练新模型 (bert-base-chinese)")
     print("=" * 80)
@@ -81,13 +87,15 @@ def train(use_contrastive=False, contrastive_weight=0.2, freeze_bert=False):
     tokenizer = AutoTokenizer.from_pretrained("bert-base-chinese")
     bert = AutoModel.from_pretrained("bert-base-chinese")
 
+    original_layers = config.NUM_LAYERS
+    config.NUM_LAYERS = num_layers
     model = create_new_model(use_bert=True, bert_model=bert).to(config.DEVICE)
     if freeze_bert:
         for param in model.bert.bert_model.parameters():
             param.requires_grad = False
 
     train_loader, val_loader = get_bert_dataloaders(
-        train_df, val_df, tokenizer, batch_size=32, num_workers=2
+        train_df, val_df, tokenizer, batch_size=64, num_workers=2
     )
 
     bce_criterion = nn.BCEWithLogitsLoss()
@@ -97,6 +105,7 @@ def train(use_contrastive=False, contrastive_weight=0.2, freeze_bert=False):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.EPOCHS, eta_min=1e-6
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     history = {
         "train_loss": [],
@@ -122,18 +131,22 @@ def train(use_contrastive=False, contrastive_weight=0.2, freeze_bert=False):
 
             optimizer.zero_grad()
 
-            if use_contrastive:
-                logits, repr1, repr2 = model(query1, query2, return_reprs=True)
-                cont_loss = NewTextMatchModel.contrastive_loss(repr1, repr2, labels)
-            else:
-                logits = model(query1, query2)
-                cont_loss = 0.0
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                if use_contrastive:
+                    logits, repr1, repr2 = model(query1, query2, return_reprs=True)
+                    cont_loss = NewTextMatchModel.contrastive_loss(repr1, repr2, labels)
+                else:
+                    logits = model(query1, query2)
+                    cont_loss = 0.0
 
-            bce_loss = bce_criterion(logits, labels)
-            loss = bce_loss + contrastive_weight * cont_loss
-            loss.backward()
+                bce_loss = bce_criterion(logits, labels)
+                loss = bce_loss + contrastive_weight * cont_loss
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item()
             all_probs.extend(torch.sigmoid(logits).detach().cpu().numpy())
@@ -156,8 +169,9 @@ def train(use_contrastive=False, contrastive_weight=0.2, freeze_bert=False):
                 query2 = batch["query2"].to(config.DEVICE)
                 labels = batch["label"].to(config.DEVICE)
 
-                logits = model(query1, query2)
-                loss = bce_criterion(logits, labels)
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    logits = model(query1, query2)
+                    loss = bce_criterion(logits, labels)
 
                 val_total_loss += loss.item()
                 probs = torch.sigmoid(logits).cpu().numpy()
@@ -188,6 +202,7 @@ def train(use_contrastive=False, contrastive_weight=0.2, freeze_bert=False):
             )
 
     plot_training_history(history, "training_history_new_bert.png")
+    config.NUM_LAYERS = original_layers
     return model, history
 
 
@@ -195,13 +210,17 @@ def main():
     parser = argparse.ArgumentParser(description="Train new model with bert-base-chinese")
     parser.add_argument("--contrastive", action="store_true", help="enable contrastive loss")
     parser.add_argument("--contrastive_weight", type=float, default=0.2)
-    parser.add_argument("--freeze_bert", action="store_true")
+    parser.add_argument("--freeze_bert", action="store_true", default=True)
+    parser.add_argument("--num_layers", type=int, default=1)
+    parser.add_argument("--no_amp", action="store_true")
     args = parser.parse_args()
 
     train(
         use_contrastive=args.contrastive,
         contrastive_weight=args.contrastive_weight,
         freeze_bert=args.freeze_bert,
+        num_layers=args.num_layers,
+        use_amp=not args.no_amp,
     )
 
 

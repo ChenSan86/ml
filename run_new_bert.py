@@ -78,8 +78,10 @@ def main():
     parser.add_argument("--model_path", type=str, default="best_model_new_bert.pth")
     parser.add_argument("--contrastive", action="store_true")
     parser.add_argument("--contrastive_weight", type=float, default=0.2)
-    parser.add_argument("--freeze_bert", action="store_true")
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--freeze_bert", action="store_true", default=True)
+    parser.add_argument("--num_layers", type=int, default=1)
+    parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=2)
     args = parser.parse_args()
 
@@ -90,6 +92,8 @@ def main():
             use_contrastive=args.contrastive,
             contrastive_weight=args.contrastive_weight,
             freeze_bert=args.freeze_bert,
+            num_layers=args.num_layers,
+            use_amp=not args.no_amp,
         )
 
     if args.mode in ["eval", "all"]:
